@@ -31,6 +31,28 @@ bash run_benchmark.sh
 
 This produces benchmark outputs in `runs/` and logs in `logs/`.
 
+### Single-GPU Targeted Run (Recommended for Local Debugging)
+
+To run one model on one dataset on one GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+NPROC_PER_NODE=1 \
+TASKS_OVERRIDE="gsm8k:128" \
+MODEL_DRAFT_PAIRS_OVERRIDE="Qwen/Qwen3-4B|z-lab/Qwen3-4B-DFlash-b16" \
+TEMPERATURES_OVERRIDE="0.0" \
+MODES_OVERRIDE="sdpa" \
+DISABLE_CPP_COMPACT_CACHE=1 \
+bash run_benchmark.sh
+```
+
+Useful overrides:
+
+- `MAX_SAMPLES_OVERRIDE` (for quick smoke tests)
+- `MAX_NEW_TOKENS` (default `2048`)
+- `TREE_BUDGET_OVERRIDE` (for DDTree budget list)
+- `MODES_OVERRIDE="sdpa"` to avoid running both modes
+
 ## Reproduce Paper Artifacts
 
 Generate the plots:

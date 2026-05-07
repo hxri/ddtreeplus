@@ -84,6 +84,21 @@ def maybe_enable_cpp_compact(enabled: bool) -> None:
 def build_ddtree_tree(
     draft_logits: torch.Tensor,
     budget: int,
+    adaptive_branching: bool = False,
+    entropy_thresholds: list[float] | None = None,
+    branch_k_values: list[int] | None = None,
+    # coverage-based: branch to min k that covers >= min_coverage mass
+    coverage_branching: bool = False,
+    min_coverage: float = 0.8,
+    # budget-proportional: k_i = floor(budget * H_i / sum(H))
+    budget_proportional_branching: bool = False,
+    budget_proportional_alpha: float = 1.0,
+    budget_proportional_base_width: int = 1,
+    budget_proportional_exact_budget: bool = False,
+    budget_proportional_max_width: int | None = None,
+    # draft-prob threshold: branch to tokens with p_draft >= prob_threshold
+    prob_threshold_branching: bool = False,
+    prob_threshold: float = 0.05,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[dict[int, int]], torch.Tensor, dict[str, float]]:
     build_subtimes = empty_stage_times(DDTREE_TREE_BUILD_STAGE_ORDER)
 
@@ -99,12 +114,137 @@ def build_ddtree_tree(
             build_subtimes,
         )
 
-    topk = min(budget, draft_logits.shape[-1])
+    vocab_size = int(draft_logits.shape[-1])
     depth_limit = int(draft_logits.shape[0])
+    entropy_thresholds = entropy_thresholds or []
+    branch_k_values = branch_k_values or [min(budget, vocab_size)]
+
+    # Fixed-width behavior: a single top-k is used at every depth.
+    if not adaptive_branching and not coverage_branching and not budget_proportional_branching and not prob_threshold_branching:
+        fixed_topk = min(budget, vocab_size)
+        branch_widths = [fixed_topk for _ in range(depth_limit)]
+    elif adaptive_branching:
+        # Adaptive-width behavior: choose k per position from entropy bins.
+        logits_for_entropy = draft_logits.float()
+        log_probs = torch.log_softmax(logits_for_entropy, dim=-1)
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=-1)
+        entropy_cpu = entropy.to(device="cpu", dtype=torch.float32).tolist()
+
+        branch_widths = []
+        for entropy_value in entropy_cpu:
+            bucket_index = 0
+            for threshold in entropy_thresholds:
+                if entropy_value > threshold:
+                    bucket_index += 1
+                else:
+                    break
+            width = branch_k_values[bucket_index]
+            width = max(1, min(int(width), budget, vocab_size))
+            branch_widths.append(width)
+
+    elif coverage_branching:
+        # Nucleus-style: min k whose cumulative probability mass >= min_coverage.
+        logits_for_coverage = draft_logits.float()
+        probs = torch.softmax(logits_for_coverage, dim=-1)
+        sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
+        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)  # [depth, vocab]
+        # k = first index where cumsum >= min_coverage, clipped to [1, budget]
+        coverage_tensor = (cumsum_probs >= min_coverage).float()
+        # argmax gives first True position (0-based), +1 for count
+        k_per_pos = coverage_tensor.argmax(dim=-1) + 1  # [depth]
+        k_per_pos = k_per_pos.clamp(1, min(budget, vocab_size))
+        branch_widths = k_per_pos.to(device="cpu", dtype=torch.long).tolist()
+        branch_widths = [int(w) for w in branch_widths]
+
+    elif budget_proportional_branching:
+        # Allocate budget proportional to per-position entropy.
+        logits_for_entropy = draft_logits.float()
+        log_probs = torch.log_softmax(logits_for_entropy, dim=-1)
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=-1)  # [depth]
+        entropy_cpu = entropy.to(device="cpu", dtype=torch.float32)
+        depth_limit_local = int(draft_logits.shape[0])
+
+        # alpha=1.0 reproduces the original proportional weighting.
+        alpha = float(max(1e-6, budget_proportional_alpha))
+        weights = entropy_cpu.clamp_min(0.0).pow(alpha)
+        if float(weights.sum().item()) <= 0.0:
+            weights = torch.ones_like(weights)
+        weight_sum = float(weights.sum().item())
+        fractions = (weights / weight_sum).tolist()
+
+        max_width = min(budget, vocab_size)
+        if budget_proportional_max_width is not None:
+            max_width = min(max_width, max(1, int(budget_proportional_max_width)))
+        base_width = max(1, int(budget_proportional_base_width))
+
+        if budget_proportional_exact_budget and budget >= depth_limit_local:
+            widths = [base_width for _ in range(depth_limit_local)]
+            base_total = sum(widths)
+            if base_total > budget:
+                widths = [1 for _ in range(depth_limit_local)]
+                base_total = depth_limit_local
+
+            remaining = max(0, budget - base_total)
+            raw_alloc = [fraction * remaining for fraction in fractions]
+            add_floor = [int(value) for value in raw_alloc]
+            widths = [widths[i] + add_floor[i] for i in range(depth_limit_local)]
+
+            leftover = remaining - sum(add_floor)
+            if leftover > 0:
+                fractional_order = sorted(
+                    range(depth_limit_local),
+                    key=lambda i: raw_alloc[i] - float(add_floor[i]),
+                    reverse=True,
+                )
+                for i in fractional_order[:leftover]:
+                    widths[i] += 1
+
+            widths = [max(1, min(int(width), max_width)) for width in widths]
+
+            # If clamping to max_width left spare budget, refill by entropy rank.
+            spare = budget - sum(widths)
+            if spare > 0:
+                refill_order = sorted(range(depth_limit_local), key=lambda i: fractions[i], reverse=True)
+                while spare > 0:
+                    progressed = False
+                    for i in refill_order:
+                        if widths[i] < max_width:
+                            widths[i] += 1
+                            spare -= 1
+                            progressed = True
+                            if spare == 0:
+                                break
+                    if not progressed:
+                        break
+
+            branch_widths = widths
+        else:
+            base_total = base_width * depth_limit_local
+            remaining = max(0, budget - base_total)
+            branch_widths = []
+            for fraction in fractions:
+                width = base_width + int(fraction * remaining)
+                width = max(1, min(int(width), max_width))
+                branch_widths.append(width)
+
+    elif prob_threshold_branching:
+        # Branch into tokens with p_draft >= prob_threshold, at least 1.
+        logits_for_thresh = draft_logits.float()
+        probs = torch.softmax(logits_for_thresh, dim=-1)
+        sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
+        # number of tokens above threshold per position
+        above = (sorted_probs >= prob_threshold).sum(dim=-1)  # [depth]
+        above = above.clamp(1, min(budget, vocab_size))
+        branch_widths = above.to(device="cpu", dtype=torch.long).tolist()
+        branch_widths = [int(w) for w in branch_widths]
+
+    max_topk = max(branch_widths)
 
     copy_start = cuda_time()
     logits = draft_logits.float()
-    top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
+    top_logits, top_token_ids = torch.topk(logits, k=max_topk, dim=-1)
     log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
     top_log_probs_cpu = (top_logits - log_z).to(device="cpu", dtype=torch.float32)
     top_token_ids_cpu = top_token_ids.to(device="cpu", dtype=torch.long)
@@ -136,7 +276,8 @@ def build_ddtree_tree(
         child_maps[parent_index][token_id] = current_index
         node_count += 1
 
-        if rank + 1 < topk:
+        current_depth_width = branch_widths[depth - 1]
+        if rank + 1 < current_depth_width:
             sibling_ranks = ranks[:-1] + (rank + 1,)
             sibling_logw = logw - float(top_log_probs_np[depth - 1, rank]) + float(top_log_probs_np[depth - 1, rank + 1])
             heapq.heappush(heap, (-sibling_logw, sibling_ranks, parent_index, depth, rank + 1, sibling_logw))
@@ -288,6 +429,18 @@ def ddtree_generate(
     stop_token_ids: list[int],
     temperature: float = 0.0,
     tree_budget: int | None = None,
+    adaptive_branching: bool = False,
+    entropy_thresholds: list[float] | None = None,
+    branch_k_values: list[int] | None = None,
+    coverage_branching: bool = False,
+    min_coverage: float = 0.8,
+    budget_proportional_branching: bool = False,
+    budget_proportional_alpha: float = 1.0,
+    budget_proportional_base_width: int = 1,
+    budget_proportional_exact_budget: bool = False,
+    budget_proportional_max_width: int | None = None,
+    prob_threshold_branching: bool = False,
+    prob_threshold: float = 0.05,
     save_tree_traces: bool = False,
 ) -> SimpleNamespace:
     if block_size <= 1:
@@ -380,7 +533,20 @@ def ddtree_generate(
 
         tree_build_start = cuda_time()
         node_token_ids, node_depths, parents, child_maps, visibility_cpu, tree_build_subtimes = build_ddtree_tree(
-            draft_logits[0], tree_budget
+            draft_logits[0],
+            tree_budget,
+            adaptive_branching=adaptive_branching,
+            entropy_thresholds=entropy_thresholds,
+            branch_k_values=branch_k_values,
+            coverage_branching=coverage_branching,
+            min_coverage=min_coverage,
+            budget_proportional_branching=budget_proportional_branching,
+            budget_proportional_alpha=budget_proportional_alpha,
+            budget_proportional_base_width=budget_proportional_base_width,
+            budget_proportional_exact_budget=budget_proportional_exact_budget,
+            budget_proportional_max_width=budget_proportional_max_width,
+            prob_threshold_branching=prob_threshold_branching,
+            prob_threshold=prob_threshold,
         )
         stage_times["tree_build"] += cuda_time() - tree_build_start
         for stage_name, stage_elapsed in tree_build_subtimes.items():

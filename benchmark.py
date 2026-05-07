@@ -26,9 +26,64 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--flash-attn", action="store_true")
+    parser.add_argument("--ddtree-adaptive-branching", action="store_true")
+    parser.add_argument("--ddtree-entropy-thresholds", type=str, default="0.5,1.5")
+    parser.add_argument("--ddtree-branch-k-values", type=str, default="1,3,8")
+    # Coverage-based branching
+    parser.add_argument("--ddtree-coverage-branching", action="store_true")
+    parser.add_argument("--ddtree-min-coverage", type=float, default=0.8)
+    # Budget-proportional branching
+    parser.add_argument("--ddtree-budget-proportional-branching", action="store_true")
+    parser.add_argument("--ddtree-budget-proportional-alpha", type=float, default=1.0)
+    parser.add_argument("--ddtree-budget-proportional-base-width", type=int, default=1)
+    parser.add_argument("--ddtree-budget-proportional-exact-budget", action="store_true")
+    parser.add_argument("--ddtree-budget-proportional-max-width", type=int, default=None)
+    # Draft-probability threshold branching
+    parser.add_argument("--ddtree-prob-threshold-branching", action="store_true")
+    parser.add_argument("--ddtree-prob-threshold", type=float, default=0.05)
     parser.add_argument("--disable-cpp-compact-cache", action="store_true")
     parser.add_argument("--save-path", type=str, default=None)
     args = parser.parse_args()
+
+    entropy_thresholds = [
+        float(entropy_threshold)
+        for entropy_threshold in args.ddtree_entropy_thresholds.split(",")
+        if entropy_threshold.strip() != ""
+    ]
+    branch_k_values = [
+        int(branch_k_value)
+        for branch_k_value in args.ddtree_branch_k_values.split(",")
+        if branch_k_value.strip() != ""
+    ]
+    if args.ddtree_adaptive_branching:
+        if len(branch_k_values) != len(entropy_thresholds) + 1:
+            raise ValueError(
+                "--ddtree-branch-k-values must contain exactly len(--ddtree-entropy-thresholds)+1 values when adaptive branching is enabled"
+            )
+        if any(branch_k_value <= 0 for branch_k_value in branch_k_values):
+            raise ValueError("All values in --ddtree-branch-k-values must be > 0")
+        if any(
+            entropy_thresholds[index] > entropy_thresholds[index + 1]
+            for index in range(len(entropy_thresholds) - 1)
+        ):
+            raise ValueError("--ddtree-entropy-thresholds must be sorted in non-decreasing order")
+
+    enabled_branch_modes = [
+        bool(args.ddtree_adaptive_branching),
+        bool(args.ddtree_coverage_branching),
+        bool(args.ddtree_budget_proportional_branching),
+        bool(args.ddtree_prob_threshold_branching),
+    ]
+    if sum(enabled_branch_modes) > 1:
+        raise ValueError("Enable at most one DDTree branching mode at a time")
+
+    if args.ddtree_budget_proportional_branching:
+        if args.ddtree_budget_proportional_alpha <= 0:
+            raise ValueError("--ddtree-budget-proportional-alpha must be > 0")
+        if args.ddtree_budget_proportional_base_width <= 0:
+            raise ValueError("--ddtree-budget-proportional-base-width must be > 0")
+        if args.ddtree_budget_proportional_max_width is not None and args.ddtree_budget_proportional_max_width <= 0:
+            raise ValueError("--ddtree-budget-proportional-max-width must be > 0")
 
     random.seed(0)
     np.random.seed(0)
@@ -128,6 +183,18 @@ def main() -> None:
                 tree_budget=method_key_to_tree_budget[method_key],
                 stop_token_ids=[tokenizer.eos_token_id],
                 temperature=args.temperature,
+                adaptive_branching=args.ddtree_adaptive_branching,
+                entropy_thresholds=entropy_thresholds,
+                branch_k_values=branch_k_values,
+                coverage_branching=args.ddtree_coverage_branching,
+                min_coverage=args.ddtree_min_coverage,
+                budget_proportional_branching=args.ddtree_budget_proportional_branching,
+                budget_proportional_alpha=args.ddtree_budget_proportional_alpha,
+                budget_proportional_base_width=args.ddtree_budget_proportional_base_width,
+                budget_proportional_exact_budget=args.ddtree_budget_proportional_exact_budget,
+                budget_proportional_max_width=args.ddtree_budget_proportional_max_width,
+                prob_threshold_branching=args.ddtree_prob_threshold_branching,
+                prob_threshold=args.ddtree_prob_threshold,
             )
 
     responses = []
@@ -179,6 +246,18 @@ def main() -> None:
                         tree_budget=method_key_to_tree_budget[method_key],
                         stop_token_ids=[tokenizer.eos_token_id],
                         temperature=args.temperature,
+                        adaptive_branching=args.ddtree_adaptive_branching,
+                        entropy_thresholds=entropy_thresholds,
+                        branch_k_values=branch_k_values,
+                        coverage_branching=args.ddtree_coverage_branching,
+                        min_coverage=args.ddtree_min_coverage,
+                        budget_proportional_branching=args.ddtree_budget_proportional_branching,
+                        budget_proportional_alpha=args.ddtree_budget_proportional_alpha,
+                        budget_proportional_base_width=args.ddtree_budget_proportional_base_width,
+                        budget_proportional_exact_budget=args.ddtree_budget_proportional_exact_budget,
+                        budget_proportional_max_width=args.ddtree_budget_proportional_max_width,
+                        prob_threshold_branching=args.ddtree_prob_threshold_branching,
+                        prob_threshold=args.ddtree_prob_threshold,
                     )
 
             spec_response = response[methods_to_run[-1]]

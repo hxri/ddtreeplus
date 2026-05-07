@@ -1,5 +1,4 @@
 import os
-import warnings
 from datetime import timedelta
 from typing import Any, List, Optional
 from torch import distributed as dist
@@ -17,7 +16,6 @@ __all__ = [
 ]
 def init() -> None:
     if "RANK" not in os.environ:
-        warnings.warn("Environment variable `RANK` is not set. Skipping distributed initialization.")
         return
     dist.init_process_group(backend="nccl", init_method="env://", timeout=timedelta(minutes=300))
 

@@ -1,0 +1,3 @@
+2026-05-07 10:12:21.938 | WARNING  | __main__:main:86 - DDTree uses a custom tree attention mask on the target model. For compatibility, forcing the target verifier to torch.sdpa.
+Loading weights:   0%|          | 0/398 [00:00<?, ?it/s]Loading weights: 100%|██████████| 398/398 [00:00<00:00, 6973.95it/s]
+Loading weights:   0%|          | 0/58 [00:00<?, ?it/s]Loading weights: 100%|██████████| 58/58 [00:00<00:00, 10049.97it/s]
