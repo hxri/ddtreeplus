@@ -1,3 +1,2 @@
-Loading weights:   0%|          | 0/398 [00:00<?, ?it/s]Loading weights: 100%|██████████| 398/398 [00:00<00:00, 6720.02it/s]
-Loading weights:   0%|          | 0/58 [00:00<?, ?it/s]Loading weights: 100%|██████████| 58/58 [00:00<00:00, 3201.67it/s]
-  0%|          | 0/2 [00:00<?, ?it/s] 50%|█████     | 1/2 [00:02<00:02,  2.09s/it]100%|██████████| 2/2 [00:04<00:00,  2.22s/it]100%|██████████| 2/2 [00:04<00:00,  2.20s/it]
+2026-05-08 10:16:23.300 | INFO     | ddtree:load_cpp_compact_module:68 - Loaded inline C++ tail cache compaction extension for DDTree.
+Loading weights:   0%|          | 0/398 [00:00<?, ?it/s]Loading weights: 100%|██████████| 398/398 [00:00<00:00, 14218.22it/s]

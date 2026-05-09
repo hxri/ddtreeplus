@@ -1,4 +1,5 @@
 import heapq
+import json
 import time
 from functools import lru_cache
 from types import SimpleNamespace
@@ -81,12 +82,194 @@ def maybe_enable_cpp_compact(enabled: bool) -> None:
         load_cpp_compact_module()
 
 
+def load_tree_rl_policy(policy_path: str | None) -> dict | None:
+    if policy_path is None:
+        return None
+    with open(policy_path, "r", encoding="utf-8") as handle:
+        policy = json.load(handle)
+    return policy
+
+
+def _build_rl_width_profiles(
+    depth_limit: int,
+    budget: int,
+    vocab_size: int,
+    entropy_cpu: torch.Tensor,
+    base_width: int,
+    max_width: int,
+) -> tuple[list[str], list[list[int]], list[int]]:
+    widths: list[list[int]] = []
+    names: list[str] = []
+    effective_budgets: list[int] = []
+
+    def clamp_width_list(values: list[float]) -> list[int]:
+        out = []
+        for value in values:
+            width = int(round(value))
+            width = max(1, min(width, max_width, budget, vocab_size))
+            out.append(width)
+        return out
+
+    base_profiles: list[tuple[str, list[int]]] = []
+
+    # Flat high-width profile (closest to fixed-width tree).
+    base_profiles.append(("flat", clamp_width_list([max_width for _ in range(depth_limit)])))
+
+    # Front-heavy profile to maximize early acceptance probability.
+    base_profiles.append(
+        (
+            "front_heavy",
+            clamp_width_list([max(base_width, max_width / (1.0 + 0.6 * depth)) for depth in range(depth_limit)]),
+        )
+    )
+
+    # More aggressive front-heavy profile.
+    base_profiles.append(
+        (
+            "front_aggressive",
+            clamp_width_list([max(base_width, max_width / (1.0 + 1.2 * depth)) for depth in range(depth_limit)]),
+        )
+    )
+
+    # Entropy-proportional profile.
+    entropy_weights = entropy_cpu.clamp_min(0.0)
+    if float(entropy_weights.sum().item()) <= 0.0:
+        entropy_weights = torch.ones_like(entropy_weights)
+    entropy_fractions = (entropy_weights / float(entropy_weights.sum().item())).tolist()
+    base_profiles.append(
+        (
+            "entropy_proportional",
+            clamp_width_list([
+                base_width + (max_width - base_width) * frac for frac in entropy_fractions
+            ]),
+        )
+    )
+
+    # Sharpened entropy profile to focus on uncertain depths.
+    entropy_sharp = entropy_weights.pow(2.0)
+    if float(entropy_sharp.sum().item()) <= 0.0:
+        entropy_sharp = torch.ones_like(entropy_sharp)
+    entropy_sharp_fractions = (entropy_sharp / float(entropy_sharp.sum().item())).tolist()
+    base_profiles.append(
+        (
+            "entropy_sharp",
+            clamp_width_list([
+                base_width + (max_width - base_width) * frac for frac in entropy_sharp_fractions
+            ]),
+        )
+    )
+
+    # Add effective tree-budget choices per width profile.
+    budget_fractions = [0.5, 0.75, 1.0]
+    for profile_name, profile_widths in base_profiles:
+        for frac in budget_fractions:
+            eff_budget = max(1, min(budget, int(round(budget * frac))))
+            names.append(f"{profile_name}_b{frac:.2f}")
+            widths.append(profile_widths)
+            effective_budgets.append(eff_budget)
+
+    return names, widths, effective_budgets
+
+
+def _compute_rl_features(
+    entropy_cpu: torch.Tensor,
+    target_hidden: torch.Tensor | None,
+    budget: int,
+    depth_limit: int,
+    prev_acceptance: float,
+    prev_latency_ms: float,
+) -> np.ndarray:
+    entropy_np = entropy_cpu.cpu().numpy()
+    entropy_mean = float(np.mean(entropy_np))
+    entropy_std = float(np.std(entropy_np))
+    entropy_first = float(entropy_np[0]) if entropy_np.shape[0] > 0 else 0.0
+    entropy_last = float(entropy_np[-1]) if entropy_np.shape[0] > 0 else 0.0
+    entropy_slope = float((entropy_last - entropy_first) / max(depth_limit - 1, 1))
+
+    target_uncertainty = 0.0
+    latent_delta = 0.0
+    if target_hidden is not None and target_hidden.numel() > 0:
+        frontier = target_hidden[:, -1, :].float()
+        frontier_mean_abs = float(frontier.abs().mean().item())
+        target_uncertainty = float(frontier.std(unbiased=False).item() / (frontier_mean_abs + 1e-6))
+        if target_hidden.shape[1] > 1:
+            prev_frontier = target_hidden[:, -2, :].float()
+            latent_delta = float(
+                (frontier - prev_frontier).norm(dim=-1).mean().item()
+                / (frontier.norm(dim=-1).mean().item() + 1e-6)
+            )
+
+    features = np.array([
+        entropy_mean,
+        entropy_std,
+        entropy_first,
+        entropy_last,
+        entropy_slope,
+        float(target_uncertainty),
+        float(latent_delta),
+        float(budget),
+        float(depth_limit),
+        float(prev_acceptance),
+        float(prev_latency_ms),
+    ], dtype=np.float32)
+    return features
+
+
+def _select_rl_action(
+    policy: dict | None,
+    feature_vector: np.ndarray,
+    action_count: int,
+    epsilon: float,
+    rng: np.random.Generator,
+) -> tuple[int, list[float]]:
+    scores = np.zeros(action_count, dtype=np.float32)
+    features = feature_vector
+    if policy is not None:
+        policy_type = str(policy.get("policy_type", "linear_contextual_bandit"))
+        feature_mean = np.asarray(policy.get("feature_mean", []), dtype=np.float32)
+        feature_std = np.asarray(policy.get("feature_std", []), dtype=np.float32)
+        if feature_mean.ndim == 1 and feature_std.ndim == 1 and feature_mean.shape[0] == feature_vector.shape[0] and feature_std.shape[0] == feature_vector.shape[0]:
+            features = (feature_vector - feature_mean) / (feature_std + 1e-6)
+        if policy_type == "mlp_contextual_bandit":
+            state_dict = policy.get("state_dict", {})
+            w1 = np.asarray(state_dict.get("net.0.weight", []), dtype=np.float32)
+            b1 = np.asarray(state_dict.get("net.0.bias", []), dtype=np.float32)
+            w2 = np.asarray(state_dict.get("net.2.weight", []), dtype=np.float32)
+            b2 = np.asarray(state_dict.get("net.2.bias", []), dtype=np.float32)
+            w3 = np.asarray(state_dict.get("net.4.weight", []), dtype=np.float32)
+            b3 = np.asarray(state_dict.get("net.4.bias", []), dtype=np.float32)
+            if (
+                w1.ndim == 2 and b1.ndim == 1 and
+                w2.ndim == 2 and b2.ndim == 1 and
+                w3.ndim == 2 and b3.ndim == 1 and
+                w1.shape[1] == features.shape[0] and
+                w3.shape[0] == action_count
+            ):
+                hidden1 = np.maximum(w1 @ features + b1, 0.0)
+                hidden2 = np.maximum(w2 @ hidden1 + b2, 0.0)
+                scores = w3 @ hidden2 + b3
+        else:
+            weights = np.asarray(policy.get("weights", []), dtype=np.float32)
+            bias = np.asarray(policy.get("bias", []), dtype=np.float32)
+            if weights.ndim == 2 and weights.shape[0] == action_count and weights.shape[1] == features.shape[0]:
+                scores = weights @ features
+                if bias.ndim == 1 and bias.shape[0] == action_count:
+                    scores = scores + bias
+
+    if float(epsilon) > 0.0 and rng.random() < float(epsilon):
+        action = int(rng.integers(0, action_count))
+    else:
+        action = int(np.argmax(scores))
+    return action, scores.tolist()
+
+
 def build_ddtree_tree(
     draft_logits: torch.Tensor,
     budget: int,
     adaptive_branching: bool = False,
     entropy_thresholds: list[float] | None = None,
     branch_k_values: list[int] | None = None,
+    target_hidden: torch.Tensor | None = None,
     # coverage-based: branch to min k that covers >= min_coverage mass
     coverage_branching: bool = False,
     min_coverage: float = 0.8,
@@ -96,10 +279,22 @@ def build_ddtree_tree(
     budget_proportional_base_width: int = 1,
     budget_proportional_exact_budget: bool = False,
     budget_proportional_max_width: int | None = None,
+    # target-latent-guided: use current target latent as a global uncertainty signal
+    target_latent_branching: bool = False,
+    target_latent_alpha: float = 1.0,
+    target_latent_beta: float = 0.5,
+    target_latent_depth_decay: float = 1.0,
+    # RL branching: contextual policy selects among width profiles.
+    rl_branching: bool = False,
+    rl_policy: dict | None = None,
+    rl_epsilon: float = 0.0,
+    rl_rng: np.random.Generator | None = None,
+    rl_prev_acceptance: float = 0.0,
+    rl_prev_latency_ms: float = 0.0,
     # draft-prob threshold: branch to tokens with p_draft >= prob_threshold
     prob_threshold_branching: bool = False,
     prob_threshold: float = 0.05,
-) -> tuple[torch.Tensor, torch.Tensor, list[int], list[dict[int, int]], torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, list[int], list[dict[int, int]], torch.Tensor, dict[str, float], dict]:
     build_subtimes = empty_stage_times(DDTREE_TREE_BUILD_STAGE_ORDER)
 
     if budget <= 0 or draft_logits.shape[0] == 0:
@@ -112,6 +307,7 @@ def build_ddtree_tree(
             [dict()],
             visibility,
             build_subtimes,
+            {},
         )
 
     vocab_size = int(draft_logits.shape[-1])
@@ -120,7 +316,11 @@ def build_ddtree_tree(
     branch_k_values = branch_k_values or [min(budget, vocab_size)]
 
     # Fixed-width behavior: a single top-k is used at every depth.
-    if not adaptive_branching and not coverage_branching and not budget_proportional_branching and not prob_threshold_branching:
+    tree_meta: dict = {}
+
+    tree_budget_for_build = budget
+
+    if not adaptive_branching and not coverage_branching and not budget_proportional_branching and not target_latent_branching and not rl_branching and not prob_threshold_branching:
         fixed_topk = min(budget, vocab_size)
         branch_widths = [fixed_topk for _ in range(depth_limit)]
     elif adaptive_branching:
@@ -229,6 +429,150 @@ def build_ddtree_tree(
                 width = max(1, min(int(width), max_width))
                 branch_widths.append(width)
 
+    elif target_latent_branching:
+        # Use the current target latent as a global uncertainty signal, while
+        # still allocating widths across future depths from draft entropy.
+        logits_for_entropy = draft_logits.float()
+        log_probs = torch.log_softmax(logits_for_entropy, dim=-1)
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=-1)
+        weights = entropy.to(device="cpu", dtype=torch.float32).clamp_min(0.0)
+        depth_limit_local = int(draft_logits.shape[0])
+
+        alpha = float(max(1e-6, target_latent_alpha))
+        beta = float(max(0.0, target_latent_beta))
+        depth_decay = float(max(0.0, target_latent_depth_decay))
+        weights = weights.pow(alpha)
+
+        target_uncertainty = 0.0
+        if target_hidden is not None and target_hidden.numel() > 0:
+            frontier = target_hidden[:, -1, :].float()
+            frontier_mean_abs = float(frontier.abs().mean().item())
+            latent_dispersion = float(frontier.std(unbiased=False).item() / (frontier_mean_abs + 1e-6))
+            latent_delta = 0.0
+            if target_hidden.shape[1] > 1:
+                prev_frontier = target_hidden[:, -2, :].float()
+                latent_delta = float(
+                    (frontier - prev_frontier).norm(dim=-1).mean().item()
+                    / (frontier.norm(dim=-1).mean().item() + 1e-6)
+                )
+            target_uncertainty = max(0.0, min(latent_dispersion + latent_delta, 8.0))
+
+        if target_uncertainty > 0.0:
+            depth_indices = torch.arange(depth_limit_local, dtype=torch.float32)
+            depth_boost = 1.0 + beta * target_uncertainty / (1.0 + depth_decay * depth_indices)
+            weights = weights * depth_boost
+
+        if float(weights.sum().item()) <= 0.0:
+            weights = torch.ones_like(weights)
+        weight_sum = float(weights.sum().item())
+        fractions = (weights / weight_sum).tolist()
+
+        max_width = min(budget, vocab_size)
+        if budget_proportional_max_width is not None:
+            max_width = min(max_width, max(1, int(budget_proportional_max_width)))
+        base_width = max(1, int(budget_proportional_base_width))
+
+        if budget_proportional_exact_budget and budget >= depth_limit_local:
+            widths = [base_width for _ in range(depth_limit_local)]
+            base_total = sum(widths)
+            if base_total > budget:
+                widths = [1 for _ in range(depth_limit_local)]
+                base_total = depth_limit_local
+
+            remaining = max(0, budget - base_total)
+            raw_alloc = [fraction * remaining for fraction in fractions]
+            add_floor = [int(value) for value in raw_alloc]
+            widths = [widths[i] + add_floor[i] for i in range(depth_limit_local)]
+
+            leftover = remaining - sum(add_floor)
+            if leftover > 0:
+                fractional_order = sorted(
+                    range(depth_limit_local),
+                    key=lambda i: raw_alloc[i] - float(add_floor[i]),
+                    reverse=True,
+                )
+                for i in fractional_order[:leftover]:
+                    widths[i] += 1
+
+            widths = [max(1, min(int(width), max_width)) for width in widths]
+
+            spare = budget - sum(widths)
+            if spare > 0:
+                refill_order = sorted(range(depth_limit_local), key=lambda i: fractions[i], reverse=True)
+                while spare > 0:
+                    progressed = False
+                    for i in refill_order:
+                        if widths[i] < max_width:
+                            widths[i] += 1
+                            spare -= 1
+                            progressed = True
+                            if spare == 0:
+                                break
+                    if not progressed:
+                        break
+
+            branch_widths = widths
+        else:
+            base_total = base_width * depth_limit_local
+            remaining = max(0, budget - base_total)
+            branch_widths = []
+            for fraction in fractions:
+                width = base_width + int(fraction * remaining)
+                width = max(1, min(int(width), max_width))
+                branch_widths.append(width)
+
+    elif rl_branching:
+        logits_for_entropy = draft_logits.float()
+        log_probs = torch.log_softmax(logits_for_entropy, dim=-1)
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=-1)
+        entropy_cpu = entropy.to(device="cpu", dtype=torch.float32)
+
+        max_width = min(budget, vocab_size)
+        if budget_proportional_max_width is not None:
+            max_width = min(max_width, max(1, int(budget_proportional_max_width)))
+        base_width = max(1, int(budget_proportional_base_width))
+
+        profile_names, profile_widths, profile_budgets = _build_rl_width_profiles(
+            depth_limit=depth_limit,
+            budget=budget,
+            vocab_size=vocab_size,
+            entropy_cpu=entropy_cpu,
+            base_width=base_width,
+            max_width=max_width,
+        )
+        feature_vector = _compute_rl_features(
+            entropy_cpu=entropy_cpu,
+            target_hidden=target_hidden,
+            budget=budget,
+            depth_limit=depth_limit,
+            prev_acceptance=rl_prev_acceptance,
+            prev_latency_ms=rl_prev_latency_ms,
+        )
+        if rl_rng is None:
+            rl_rng = np.random.default_rng(0)
+        action_id, action_scores = _select_rl_action(
+            policy=rl_policy,
+            feature_vector=feature_vector,
+            action_count=len(profile_widths),
+            epsilon=rl_epsilon,
+            rng=rl_rng,
+        )
+        branch_widths = profile_widths[action_id]
+        tree_budget_for_build = profile_budgets[action_id]
+        tree_meta = {
+            "rl": {
+                "action_id": int(action_id),
+                "action_name": profile_names[action_id],
+                "action_names": profile_names,
+                "action_scores": action_scores,
+                "features": feature_vector.tolist(),
+                "branch_widths": [int(width) for width in branch_widths],
+                "effective_budget": int(tree_budget_for_build),
+            }
+        }
+
     elif prob_threshold_branching:
         # Branch into tokens with p_draft >= prob_threshold, at least 1.
         logits_for_thresh = draft_logits.float()
@@ -257,14 +601,14 @@ def build_ddtree_tree(
     first_logw = float(top_log_probs_np[0, 0])
     heap: list[tuple[float, tuple[int, ...], int, int, int, float]] = [(-first_logw, (0,), 0, 1, 0, first_logw)]
 
-    node_token_ids_np = np.empty(budget, dtype=np.int64)
-    node_depths_np = np.empty(budget, dtype=np.int64)
-    parents_np = np.empty(budget + 1, dtype=np.int32)
+    node_token_ids_np = np.empty(tree_budget_for_build, dtype=np.int64)
+    node_depths_np = np.empty(tree_budget_for_build, dtype=np.int64)
+    parents_np = np.empty(tree_budget_for_build + 1, dtype=np.int32)
     parents_np[0] = -1
     child_maps: list[dict[int, int]] = [dict()]
     node_count = 0
 
-    while heap and node_count < budget:
+    while heap and node_count < tree_budget_for_build:
         _, ranks, parent_index, depth, rank, logw = heapq.heappop(heap)
 
         token_id = int(top_token_ids_np[depth - 1, rank])
@@ -304,7 +648,7 @@ def build_ddtree_tree(
     visibility = torch.from_numpy(visibility_np)
     parents = parents_np[:current_length].tolist()
 
-    return node_token_ids, node_depths, parents, child_maps, visibility, build_subtimes
+    return node_token_ids, node_depths, parents, child_maps, visibility, build_subtimes, tree_meta
 
 
 def compile_ddtree_tree(
@@ -439,6 +783,14 @@ def ddtree_generate(
     budget_proportional_base_width: int = 1,
     budget_proportional_exact_budget: bool = False,
     budget_proportional_max_width: int | None = None,
+    target_latent_branching: bool = False,
+    target_latent_alpha: float = 1.0,
+    target_latent_beta: float = 0.5,
+    target_latent_depth_decay: float = 1.0,
+    rl_branching: bool = False,
+    rl_policy: dict | None = None,
+    rl_epsilon: float = 0.0,
+    rl_reward_latency_penalty: float = 0.05,
     prob_threshold_branching: bool = False,
     prob_threshold: float = 0.05,
     save_tree_traces: bool = False,
@@ -504,7 +856,11 @@ def ddtree_generate(
     start = input_ids.shape[1]
     acceptance_lengths = []
     round_timestamps = []
+    rl_round_records = []
     round_trees = [] if save_tree_traces else None
+    rl_rng = np.random.default_rng(0)
+    rl_prev_acceptance = 0.0
+    rl_prev_latency_ms = 0.0
     draft_prefill = True
     previous_tree_start = 0
     previous_tree_length = 0
@@ -532,12 +888,13 @@ def ddtree_generate(
             stage_times["draft"] += draft_stage_elapsed
 
         tree_build_start = cuda_time()
-        node_token_ids, node_depths, parents, child_maps, visibility_cpu, tree_build_subtimes = build_ddtree_tree(
+        node_token_ids, node_depths, parents, child_maps, visibility_cpu, tree_build_subtimes, tree_meta = build_ddtree_tree(
             draft_logits[0],
             tree_budget,
             adaptive_branching=adaptive_branching,
             entropy_thresholds=entropy_thresholds,
             branch_k_values=branch_k_values,
+            target_hidden=target_hidden,
             coverage_branching=coverage_branching,
             min_coverage=min_coverage,
             budget_proportional_branching=budget_proportional_branching,
@@ -545,10 +902,21 @@ def ddtree_generate(
             budget_proportional_base_width=budget_proportional_base_width,
             budget_proportional_exact_budget=budget_proportional_exact_budget,
             budget_proportional_max_width=budget_proportional_max_width,
+            target_latent_branching=target_latent_branching,
+            target_latent_alpha=target_latent_alpha,
+            target_latent_beta=target_latent_beta,
+            target_latent_depth_decay=target_latent_depth_decay,
+            rl_branching=rl_branching,
+            rl_policy=rl_policy,
+            rl_epsilon=rl_epsilon,
+            rl_rng=rl_rng,
+            rl_prev_acceptance=rl_prev_acceptance,
+            rl_prev_latency_ms=rl_prev_latency_ms,
             prob_threshold_branching=prob_threshold_branching,
             prob_threshold=prob_threshold,
         )
-        stage_times["tree_build"] += cuda_time() - tree_build_start
+        tree_build_elapsed = cuda_time() - tree_build_start
+        stage_times["tree_build"] += tree_build_elapsed
         for stage_name, stage_elapsed in tree_build_subtimes.items():
             stage_times[stage_name] += stage_elapsed
 
@@ -569,7 +937,8 @@ def ddtree_generate(
             previous_tree_start=previous_tree_start,
             previous_tree_length=previous_tree_length,
         )
-        stage_times["tree_compile"] += cuda_time() - tree_compile_start
+        tree_compile_elapsed = cuda_time() - tree_compile_start
+        stage_times["tree_compile"] += tree_compile_elapsed
 
         verify_stage_start = cuda_time()
         output = target(
@@ -580,7 +949,8 @@ def ddtree_generate(
             use_cache=True,
             output_hidden_states=True,
         )
-        stage_times["verify"] += cuda_time() - verify_stage_start
+        verify_elapsed = cuda_time() - verify_stage_start
+        stage_times["verify"] += verify_elapsed
 
         commit_stage_start = cuda_time()
         posterior = sample(output.logits, temperature)
@@ -595,6 +965,22 @@ def ddtree_generate(
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids).index_select(1, accepted_index_tensor)
 
         acceptance_lengths.append(len(accepted_indices))
+        if rl_branching and "rl" in tree_meta:
+            latency_ms = 1000.0 * (tree_build_elapsed + tree_compile_elapsed + verify_elapsed)
+            reward = float(len(accepted_indices) - rl_reward_latency_penalty * latency_ms)
+            rl_round_records.append({
+                "action_id": int(tree_meta["rl"]["action_id"]),
+                "action_name": tree_meta["rl"]["action_name"],
+                "features": tree_meta["rl"]["features"],
+                "action_scores": tree_meta["rl"]["action_scores"],
+                "branch_widths": tree_meta["rl"]["branch_widths"],
+                "effective_budget": int(tree_meta["rl"].get("effective_budget", tree_budget)),
+                "accepted_length": int(len(accepted_indices)),
+                "latency_ms": float(latency_ms),
+                "reward": reward,
+            })
+            rl_prev_acceptance = float(len(accepted_indices))
+            rl_prev_latency_ms = float(latency_ms)
         start += len(accepted_indices)
         stage_times["commit"] += cuda_time() - commit_stage_start
         round_timestamps.append(cuda_time() - round_clock_start)
@@ -634,5 +1020,6 @@ def ddtree_generate(
         decode_rounds=len(acceptance_lengths),
         stage_times=stage_times,
         round_timestamps=round_timestamps,
+        rl_round_records=rl_round_records,
         round_trees=round_trees,
     )

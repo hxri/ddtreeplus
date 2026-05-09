@@ -112,6 +112,42 @@ if [[ -n "${DDTREE_BUDGET_PROP_MAX_WIDTH:-}" ]]; then
   COMMON_BENCHMARK_ARGS+=(--ddtree-budget-proportional-max-width "${DDTREE_BUDGET_PROP_MAX_WIDTH}")
 fi
 
+if [[ "${DDTREE_TARGET_LATENT_BRANCHING:-0}" == "1" ]]; then
+  COMMON_BENCHMARK_ARGS+=(--ddtree-target-latent-branching)
+fi
+
+if [[ -n "${DDTREE_TARGET_LATENT_ALPHA:-}" ]]; then
+  COMMON_BENCHMARK_ARGS+=(--ddtree-target-latent-alpha "${DDTREE_TARGET_LATENT_ALPHA}")
+fi
+
+if [[ -n "${DDTREE_TARGET_LATENT_BETA:-}" ]]; then
+  COMMON_BENCHMARK_ARGS+=(--ddtree-target-latent-beta "${DDTREE_TARGET_LATENT_BETA}")
+fi
+
+if [[ -n "${DDTREE_TARGET_LATENT_DEPTH_DECAY:-}" ]]; then
+  COMMON_BENCHMARK_ARGS+=(--ddtree-target-latent-depth-decay "${DDTREE_TARGET_LATENT_DEPTH_DECAY}")
+fi
+
+if [[ "${DDTREE_RL_BRANCHING:-0}" == "1" ]]; then
+  COMMON_BENCHMARK_ARGS+=(--ddtree-rl-branching)
+fi
+
+if [[ -n "${DDTREE_RL_POLICY_PATH:-}" ]]; then
+  COMMON_BENCHMARK_ARGS+=(--ddtree-rl-policy-path "${DDTREE_RL_POLICY_PATH}")
+fi
+
+if [[ -n "${DDTREE_RL_EPSILON:-}" ]]; then
+  COMMON_BENCHMARK_ARGS+=(--ddtree-rl-epsilon "${DDTREE_RL_EPSILON}")
+fi
+
+if [[ -n "${DDTREE_RL_REWARD_LATENCY_PENALTY:-}" ]]; then
+  COMMON_BENCHMARK_ARGS+=(--ddtree-rl-reward-latency-penalty "${DDTREE_RL_REWARD_LATENCY_PENALTY}")
+fi
+
+if [[ -n "${DDTREE_RL_LOG_PATH:-}" ]]; then
+  COMMON_BENCHMARK_ARGS+=(--ddtree-rl-log-path "${DDTREE_RL_LOG_PATH}")
+fi
+
 if [[ "${DDTREE_PROB_THRESHOLD_BRANCHING:-0}" == "1" ]]; then
   COMMON_BENCHMARK_ARGS+=(--ddtree-prob-threshold-branching)
 fi
@@ -234,6 +270,19 @@ for task in "${TASKS[@]}"; do
         bp_exact_slug="$(slugify "${DDTREE_BUDGET_PROP_EXACT_BUDGET:-0}")"
         bp_max_slug="$(slugify "${DDTREE_BUDGET_PROP_MAX_WIDTH:-none}")"
         adaptive_suffix="__budget_proportional_a${bp_alpha_slug}_b${bp_base_slug}_e${bp_exact_slug}_m${bp_max_slug}"
+      elif [[ "${DDTREE_TARGET_LATENT_BRANCHING:-0}" == "1" ]]; then
+        tl_alpha_slug="$(slugify "${DDTREE_TARGET_LATENT_ALPHA:-1.0}")"
+        tl_beta_slug="$(slugify "${DDTREE_TARGET_LATENT_BETA:-0.5}")"
+        tl_decay_slug="$(slugify "${DDTREE_TARGET_LATENT_DEPTH_DECAY:-1.0}")"
+        tl_base_slug="$(slugify "${DDTREE_BUDGET_PROP_BASE_WIDTH:-1}")"
+        tl_exact_slug="$(slugify "${DDTREE_BUDGET_PROP_EXACT_BUDGET:-0}")"
+        tl_max_slug="$(slugify "${DDTREE_BUDGET_PROP_MAX_WIDTH:-none}")"
+        adaptive_suffix="__target_latent_a${tl_alpha_slug}_b${tl_beta_slug}_d${tl_decay_slug}_bw${tl_base_slug}_e${tl_exact_slug}_m${tl_max_slug}"
+      elif [[ "${DDTREE_RL_BRANCHING:-0}" == "1" ]]; then
+        rl_eps_slug="$(slugify "${DDTREE_RL_EPSILON:-0.0}")"
+        rl_pen_slug="$(slugify "${DDTREE_RL_REWARD_LATENCY_PENALTY:-0.05}")"
+        rl_policy_slug="$(slugify "${DDTREE_RL_POLICY_PATH:-none}")"
+        adaptive_suffix="__rltree_eps${rl_eps_slug}_pen${rl_pen_slug}_policy${rl_policy_slug}"
       elif [[ "${DDTREE_PROB_THRESHOLD_BRANCHING:-0}" == "1" ]]; then
         adaptive_suffix="__probthresh_$(slugify "${DDTREE_PROB_THRESHOLD:-0.05}")"
       fi

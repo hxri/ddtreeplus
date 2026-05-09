@@ -1,0 +1,58 @@
+2026-05-08 16:16:37.724 | INFO     | ddtree:load_cpp_compact_module:69 - Loaded inline C++ tail cache compaction extension for DDTree.
+Loading weights:   0%|          | 0/398 [00:00<?, ?it/s]Loading weights: 100%|██████████| 398/398 [00:00<00:00, 14484.20it/s]
+Loading weights:   0%|          | 0/58 [00:00<?, ?it/s]Loading weights: 100%|██████████| 58/58 [00:00<00:00, 13478.29it/s]
+Traceback (most recent call last):
+  File "/home/ddtreeplus/benchmark.py", line 361, in <module>
+    main()
+  File "/home/ddtreeplus/benchmark.py", line 173, in main
+    dataset = load_and_process_dataset(args.dataset)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ddtreeplus/model/utils.py", line 45, in load_and_process_dataset
+    dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/datasets/load.py", line 1688, in load_dataset
+    builder_instance = load_dataset_builder(
+                       ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/datasets/load.py", line 1315, in load_dataset_builder
+    dataset_module = dataset_module_factory(
+                     ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/datasets/load.py", line 1207, in dataset_module_factory
+    raise e1 from None
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/datasets/load.py", line 1182, in dataset_module_factory
+    ).get_module()
+      ^^^^^^^^^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/datasets/load.py", line 638, in get_module
+    patterns = get_data_patterns(base_path, download_config=self.download_config)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/datasets/data_files.py", line 493, in get_data_patterns
+    return _get_data_files_patterns(resolver)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/datasets/data_files.py", line 268, in _get_data_files_patterns
+    data_files = pattern_resolver(pattern)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/datasets/data_files.py", line 372, in resolve_pattern
+    for filepath, info in fs.glob(fs_pattern, detail=True, **glob_kwargs).items():
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/huggingface_hub/hf_file_system.py", line 751, in glob
+    return super().glob(path, maxdepth=maxdepth, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/fsspec/spec.py", line 642, in glob
+    allpaths = self.find(root, maxdepth=depth, withdirs=True, detail=True, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/huggingface_hub/hf_file_system.py", line 790, in find
+    out = self._ls_tree(path, recursive=True, refresh=refresh, maxdepth=maxdepth, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/huggingface_hub/hf_file_system.py", line 637, in _ls_tree
+    for path_info in tree:
+                     ^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/huggingface_hub/hf_api.py", line 3849, in list_repo_tree
+    for path_info in paginate(path=tree_url, headers=headers, params={"recursive": recursive, "expand": expand}):
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/huggingface_hub/utils/_pagination.py", line 36, in paginate
+    hf_raise_for_status(r)
+  File "/home/ddtreeplus/.venv/lib/python3.12/site-packages/huggingface_hub/utils/_http.py", line 877, in hf_raise_for_status
+    raise _format(HfHubHTTPError, str(e), response) from e
+huggingface_hub.errors.HfHubHTTPError: Server error '500 Internal Server Error' for url 'https://huggingface.co/api/datasets/HuggingFaceH4/MATH-500/tree/6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be/data?recursive=true&expand=false' (Request ID: Root=1-69fe0c78-2871ad2f5372bbcc00329207;951d300d-49f1-4f19-8f7a-b09f4338f588)
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500
+
+Internal Error - We're working hard to fix this as soon as possible!

@@ -1,0 +1,22 @@
+{
+  "dataset": "gsm8k",
+  "runs_dir": "sweep/runs",
+  "num_files_matched": 1,
+  "num_configs": 1,
+  "fixed_mean_speedup": 4.992684460573493,
+  "configs": [
+    {
+      "config": "fixed",
+      "mean_speedup": 4.992684460573493,
+      "std_speedup": 0.0,
+      "mean_acceptance": 8.820153632577492,
+      "n_runs": 1,
+      "best_methods": [
+        "ddtree_tb128"
+      ],
+      "mean_baseline_tpt": 0.012197798409548904,
+      "delta_vs_fixed": 0.0,
+      "delta_pct": 0.0
+    }
+  ]
+}

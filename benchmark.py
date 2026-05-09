@@ -1,4 +1,5 @@
 import argparse
+import json
 import random
 from itertools import chain
 from pathlib import Path
@@ -12,7 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import distributed as dist
 from model import DFlashDraftModel, load_and_process_dataset
 from dflash import dflash_generate
-from ddtree import ddtree_generate, maybe_enable_cpp_compact
+from ddtree import ddtree_generate, maybe_enable_cpp_compact, load_tree_rl_policy
 
 
 def main() -> None:
@@ -38,6 +39,17 @@ def main() -> None:
     parser.add_argument("--ddtree-budget-proportional-base-width", type=int, default=1)
     parser.add_argument("--ddtree-budget-proportional-exact-budget", action="store_true")
     parser.add_argument("--ddtree-budget-proportional-max-width", type=int, default=None)
+    # Target-latent-guided branching
+    parser.add_argument("--ddtree-target-latent-branching", action="store_true")
+    parser.add_argument("--ddtree-target-latent-alpha", type=float, default=1.0)
+    parser.add_argument("--ddtree-target-latent-beta", type=float, default=0.5)
+    parser.add_argument("--ddtree-target-latent-depth-decay", type=float, default=1.0)
+    # RL-guided branching
+    parser.add_argument("--ddtree-rl-branching", action="store_true")
+    parser.add_argument("--ddtree-rl-policy-path", type=str, default=None)
+    parser.add_argument("--ddtree-rl-epsilon", type=float, default=0.0)
+    parser.add_argument("--ddtree-rl-reward-latency-penalty", type=float, default=0.05)
+    parser.add_argument("--ddtree-rl-log-path", type=str, default=None)
     # Draft-probability threshold branching
     parser.add_argument("--ddtree-prob-threshold-branching", action="store_true")
     parser.add_argument("--ddtree-prob-threshold", type=float, default=0.05)
@@ -72,6 +84,8 @@ def main() -> None:
         bool(args.ddtree_adaptive_branching),
         bool(args.ddtree_coverage_branching),
         bool(args.ddtree_budget_proportional_branching),
+        bool(args.ddtree_target_latent_branching),
+        bool(args.ddtree_rl_branching),
         bool(args.ddtree_prob_threshold_branching),
     ]
     if sum(enabled_branch_modes) > 1:
@@ -84,6 +98,26 @@ def main() -> None:
             raise ValueError("--ddtree-budget-proportional-base-width must be > 0")
         if args.ddtree_budget_proportional_max_width is not None and args.ddtree_budget_proportional_max_width <= 0:
             raise ValueError("--ddtree-budget-proportional-max-width must be > 0")
+
+    if args.ddtree_target_latent_branching:
+        if args.ddtree_target_latent_alpha <= 0:
+            raise ValueError("--ddtree-target-latent-alpha must be > 0")
+        if args.ddtree_target_latent_beta < 0:
+            raise ValueError("--ddtree-target-latent-beta must be >= 0")
+        if args.ddtree_target_latent_depth_decay < 0:
+            raise ValueError("--ddtree-target-latent-depth-decay must be >= 0")
+        if args.ddtree_budget_proportional_base_width <= 0:
+            raise ValueError("--ddtree-budget-proportional-base-width must be > 0 when target-latent branching is enabled")
+        if args.ddtree_budget_proportional_max_width is not None and args.ddtree_budget_proportional_max_width <= 0:
+            raise ValueError("--ddtree-budget-proportional-max-width must be > 0 when target-latent branching is enabled")
+
+    if args.ddtree_rl_branching:
+        if args.ddtree_rl_epsilon < 0 or args.ddtree_rl_epsilon > 1:
+            raise ValueError("--ddtree-rl-epsilon must be in [0, 1]")
+        if args.ddtree_rl_reward_latency_penalty < 0:
+            raise ValueError("--ddtree-rl-reward-latency-penalty must be >= 0")
+
+    rl_policy = load_tree_rl_policy(args.ddtree_rl_policy_path) if args.ddtree_rl_policy_path is not None else None
 
     random.seed(0)
     np.random.seed(0)
@@ -193,6 +227,14 @@ def main() -> None:
                 budget_proportional_base_width=args.ddtree_budget_proportional_base_width,
                 budget_proportional_exact_budget=args.ddtree_budget_proportional_exact_budget,
                 budget_proportional_max_width=args.ddtree_budget_proportional_max_width,
+                target_latent_branching=args.ddtree_target_latent_branching,
+                target_latent_alpha=args.ddtree_target_latent_alpha,
+                target_latent_beta=args.ddtree_target_latent_beta,
+                target_latent_depth_decay=args.ddtree_target_latent_depth_decay,
+                rl_branching=args.ddtree_rl_branching,
+                rl_policy=rl_policy,
+                rl_epsilon=args.ddtree_rl_epsilon,
+                rl_reward_latency_penalty=args.ddtree_rl_reward_latency_penalty,
                 prob_threshold_branching=args.ddtree_prob_threshold_branching,
                 prob_threshold=args.ddtree_prob_threshold,
             )
@@ -256,6 +298,14 @@ def main() -> None:
                         budget_proportional_base_width=args.ddtree_budget_proportional_base_width,
                         budget_proportional_exact_budget=args.ddtree_budget_proportional_exact_budget,
                         budget_proportional_max_width=args.ddtree_budget_proportional_max_width,
+                        target_latent_branching=args.ddtree_target_latent_branching,
+                        target_latent_alpha=args.ddtree_target_latent_alpha,
+                        target_latent_beta=args.ddtree_target_latent_beta,
+                        target_latent_depth_decay=args.ddtree_target_latent_depth_decay,
+                        rl_branching=args.ddtree_rl_branching,
+                        rl_policy=rl_policy,
+                        rl_epsilon=args.ddtree_rl_epsilon,
+                        rl_reward_latency_penalty=args.ddtree_rl_reward_latency_penalty,
                         prob_threshold_branching=args.ddtree_prob_threshold_branching,
                         prob_threshold=args.ddtree_prob_threshold,
                     )
@@ -279,6 +329,27 @@ def main() -> None:
         "target_attn_implementation": target_attn_implementation,
         "args": vars(args),
     }
+
+    if args.ddtree_rl_log_path is not None and dist.is_main():
+        rl_records = []
+        for sample_index, response in enumerate(responses):
+            for method_key, method_response in response.items():
+                if not method_key.startswith("ddtree_tb"):
+                    continue
+                if not hasattr(method_response, "rl_round_records"):
+                    continue
+                for round_index, round_record in enumerate(method_response.rl_round_records):
+                    rl_records.append({
+                        "sample_index": int(sample_index),
+                        "method_key": method_key,
+                        "round_index": int(round_index),
+                        **round_record,
+                    })
+        rl_log_path = Path(args.ddtree_rl_log_path)
+        rl_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with rl_log_path.open("w", encoding="utf-8") as handle:
+            for record in rl_records:
+                handle.write(json.dumps(record) + "\n")
     
     if args.save_path is not None:
         save_path = Path(args.save_path)
